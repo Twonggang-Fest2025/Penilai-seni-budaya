@@ -1,3 +1,4 @@
+
 import base64
 import json
 import os
@@ -76,38 +77,15 @@ def optimize_image_bytes(img_bytes, max_side=1600, quality=78):
         return img_bytes
 
 
-def score_sheet(img_bytes, kelas, soal_images=None):
+def score_sheet(img_bytes, kelas):
     cli = client()
     if not cli:
         raise RuntimeError("GEMINI_API_KEY belum diatur di Secrets.")
 
-    # Kompres/rescale foto agar upload ke API lebih ringan dan cepat.
     img_bytes = optimize_image_bytes(img_bytes)
     b64 = base64.b64encode(img_bytes).decode("utf-8")
-
     rubric = "\n".join([f"Soal {k}: {v}" for k, v in RUBRICS[kelas].items()])
 
-    # Foto soal yang diunggah guru menjadi referensi tambahan.
-    soal_content = []
-    if soal_images:
-        soal_content.append({
-            "type": "text",
-            "text": "Berikut foto soal asli. Gunakan foto-foto ini sebagai acuan untuk mencocokkan pertanyaan dengan jawaban siswa. Jangan mengganti pertanyaan berdasarkan pengetahuan umum."
-        })
-        for idx, soal_bytes in enumerate(soal_images, start=1):
-            soal_b64 = base64.b64encode(
-                optimize_image_bytes(soal_bytes, max_side=1400, quality=75)
-            ).decode("utf-8")
-            soal_content.append({
-                "type": "text",
-                "text": f"Foto soal {idx}"
-            })
-            soal_content.append({
-                "type": "image_url",
-                "image_url": {
-                    "url": f"data:image/jpeg;base64,{soal_b64}"
-                }
-            })
     prompt = f"""
 Anda adalah asisten pemeriksa ujian esai Seni Budaya SMA.
 Kelas: {kelas}
@@ -124,49 +102,80 @@ Tugas:
 5. Jawaban sebagian benar mendapat nilai sebagian.
 6. Jika tulisan/foto tidak terbaca, beri status PERLU CEK dan jangan menebak.
 7. Nilai tiap soal 0-20 dan total harus merupakan jumlah kelima nilai.
+8. Fokus pada lembar jawaban yang sedang diperiksa. Jangan membandingkan dengan siswa lain.
 
 Kembalikan HANYA JSON valid dengan format:
 {{
- "nama": "",
- "kelas_terbaca": "",
- "jawaban": {{"1":"","2":"","3":"","4":"","5":""}},
- "nilai": {{"1":0,"2":0,"3":0,"4":0,"5":0}},
- "status": "OK atau PERLU CEK",
- "catatan": ""
+  "nama": "",
+  "kelas_terbaca": "",
+  "jawaban": {{"1":"","2":"","3":"","4":"","5":""}},
+  "nilai": {{"1":0,"2":0,"3":0,"4":0,"5":0}},
+  "status": "OK atau PERLU CEK",
+  "catatan": ""
 }}
 """
+
     response = cli.chat.completions.create(
         model="gemini-3.8-flash",
         messages=[{
             "role": "user",
-            "content": (
-                [{"type": "text", "text": prompt}]
-                + soal_content
-                + [
-                    {
-                        "type": "text",
-                        "text": "Berikut foto lembar jawaban siswa yang harus dinilai."
-                    },
-                    {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": f"data:image/jpeg;base64,{b64}"
-                        }
+            "content": [
+                {"type": "text", "text": prompt},
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:image/jpeg;base64,{b64}"
                     }
-                ]
-            )
+                }
+            ]
         }],
         temperature=0,
         max_tokens=1200
     )
-    text = response.choices[0].message.content.strip()
-    if text.startswith("```"):
-        text = text.replace("```json", "").replace("```", "").strip()
-    data = json.loads(text)
-    vals = {str(i): max(0, min(20, int(data["nilai"].get(str(i), 0)))) for i in range(1,6)}
+
+    text_response = response.choices[0].message.content.strip()
+    if text_response.startswith("```"):
+        text_response = text_response.replace("```json", "").replace("```", "").strip()
+
+    data = json.loads(text_response)
+    vals = {
+        str(i): max(0, min(20, int(data["nilai"].get(str(i), 0))))
+        for i in range(1, 6)
+    }
     data["nilai"] = vals
     data["total"] = sum(vals.values())
     return data
+
+
+def score_batch(files, kelas, progress_callback=None):
+    """Nilai beberapa lembar secara paralel dengan batas concurrency."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    results = [None] * len(files)
+    max_workers = min(3, len(files))
+
+    def worker(index, file_bytes):
+        try:
+            data = score_sheet(file_bytes, kelas)
+            return index, data, None
+        except Exception as e:
+            return index, None, str(e)
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [
+            executor.submit(worker, i, f.getvalue())
+            for i, f in enumerate(files)
+        ]
+
+        completed = 0
+        for future in as_completed(futures):
+            index, data, error = future.result()
+            results[index] = {"data": data, "error": error}
+            completed += 1
+            if progress_callback:
+                progress_callback(completed, len(files))
+
+    return results
 
 def save_result(kelas, data, nomor=""):
     con = db()
@@ -188,66 +197,131 @@ tab1, tab2 = st.tabs(["📷 Nilai dari Foto", "📊 Rekap Nilai"])
 
 with tab1:
     kelas = st.selectbox("Pilih kelas / mata pelajaran", list(RUBRICS.keys()))
-    nomor = st.text_input("Nomor/ID siswa (opsional)", placeholder="Contoh: 001")
-
-    st.subheader("📚 Foto Soal")
-    st.caption("Upload minimal 5 foto soal. Foto-foto ini akan menjadi referensi AI saat menilai jawaban siswa.")
-    foto_soal = st.file_uploader(
-        "📎 Upload minimal 5 foto soal",
-        type=["jpg", "jpeg", "png", "webp"],
-        accept_multiple_files=True,
-        key="foto_soal"
+    nomor = st.text_input(
+        "Nomor/ID awal siswa (opsional)",
+        placeholder="Contoh: 001 — jika 10 foto, nomor menjadi 001, 002, 003, dst."
     )
 
-    if foto_soal and len(foto_soal) < 5:
-        st.warning(f"⚠️ Baru {len(foto_soal)} foto soal. Minimal 5 foto diperlukan sebelum penilaian.")
-    elif foto_soal:
-        st.success(f"✅ {len(foto_soal)} foto soal siap digunakan sebagai referensi.")
+    st.subheader("📷 1. Kamera")
+    foto_kamera = st.camera_input("Foto satu lembar jawaban")
 
-    foto = st.camera_input("📸 Foto lembar jawaban")
-    if foto is None:
-        foto = st.file_uploader("Atau pilih foto dari galeri", type=["jpg","jpeg","png","webp"])
+    st.subheader("📎 2. Upload Banyak Foto")
+    foto_upload = st.file_uploader(
+        "Pilih 5–10 foto lembar jawaban sekaligus",
+        type=["jpg", "jpeg", "png", "webp"],
+        accept_multiple_files=True,
+        key="jawaban_banyak"
+    )
 
-    if foto:
-        st.image(foto, caption="Foto yang akan diperiksa", use_container_width=True)
-        siap_nilai = foto_soal is not None and len(foto_soal) >= 5
+    jumlah_upload = len(foto_upload) if foto_upload else 0
 
-        if st.button(
-            "🚀 NILAI SEKARANG",
-            type="primary",
-            use_container_width=True,
-            disabled=not siap_nilai
-        ):
-            with st.spinner("Membaca foto soal + jawaban dan menilai..."):
-                try:
-                    soal_bytes = [f.getvalue() for f in foto_soal]
-                    data = score_sheet(
-                        foto.getvalue(),
-                        kelas,
-                        soal_images=soal_bytes
-                    )
-                    st.session_state["hasil"] = data
-                    save_result(kelas, data, nomor)
-                except Exception as e:
-                    err = str(e)
-                    if "timeout" in err.lower() or "timed out" in err.lower():
-                        st.error("⏱️ API terlalu lama merespons (batas 90 detik). Coba foto yang lebih jelas/kecil atau coba lagi.")
-                    elif "429" in err or "quota" in err.lower() or "resource_exhausted" in err.lower():
-                        st.error("⚠️ Kuota/kredit API sedang habis atau terkena batas penggunaan. Periksa penggunaan API Gemini.")
+    if jumlah_upload:
+        st.success(f"✅ {jumlah_upload} lembar jawaban dipilih.")
+        if jumlah_upload > 10:
+            st.warning("Maksimal 10 foto sekaligus. Hanya 10 foto pertama yang akan dinilai.")
+
+    total_dinilai = jumlah_upload
+    if not jumlah_upload and foto_kamera is not None:
+        total_dinilai = 1
+
+    if total_dinilai:
+        st.info(f"📄 Total yang akan dinilai: {min(total_dinilai, 10)} lembar")
+
+    siap_nilai = (
+        (foto_upload is not None and 1 <= len(foto_upload) <= 10)
+        or (not foto_upload and foto_kamera is not None)
+    )
+
+    if st.button(
+        "🚀 NILAI SEMUA LEMBAR",
+        type="primary",
+        use_container_width=True,
+        disabled=not siap_nilai
+    ):
+        if foto_upload:
+            files_to_score = foto_upload[:10]
+        else:
+            files_to_score = [foto_kamera]
+
+        progress = st.progress(0, text="Menyiapkan penilaian...")
+        status_box = st.empty()
+
+        def update_progress(done, total):
+            percent = int(done / total * 100)
+            progress.progress(
+                percent,
+                text=f"Menilai {done}/{total} lembar..."
+            )
+            status_box.info(
+                f"⏳ Selesai {done} dari {total} lembar. "
+                "Beberapa lembar diproses bersamaan agar lebih cepat."
+            )
+
+        try:
+            results = score_batch(files_to_score, kelas, update_progress)
+
+            nomor_awal = None
+            if nomor.strip().isdigit():
+                nomor_awal = int(nomor.strip())
+
+            batch_results = []
+            berhasil = 0
+            gagal = 0
+
+            for idx, result in enumerate(results):
+                data = result["data"]
+                error = result["error"]
+
+                if data is not None:
+                    if nomor_awal is not None:
+                        nomor_siswa = str(nomor_awal + idx).zfill(len(nomor.strip()))
                     else:
-                        st.error(f"❌ Gagal memproses: {err}")
+                        nomor_siswa = str(idx + 1)
 
-    if "hasil" in st.session_state:
-        d = st.session_state["hasil"]
-        st.success(f"Total nilai: {d['total']} / 100")
-        if d.get("status") == "PERLU CEK":
-            st.warning("⚠️ Hasil ini perlu diperiksa kembali karena ada bagian yang kurang terbaca.")
-        st.write(f"**Nama:** {d.get('nama','') or '(tidak terbaca)'}")
-        rows = []
-        for i in range(1,6):
-            rows.append({"Soal": f"Soal {i}", "Nilai": d["nilai"][str(i)], "Jawaban terbaca": d.get("jawaban",{}).get(str(i),"")})
-        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-        st.info("Nilai otomatis adalah bantuan pemeriksaan. Untuk tulisan yang meragukan, gunakan status PERLU CEK dan periksa foto aslinya.")
+                    save_result(kelas, data, nomor_siswa)
+                    batch_results.append({
+                        "Lembar": idx + 1,
+                        "Nomor": nomor_siswa,
+                        "Nama": data.get("nama", "") or "(tidak terbaca)",
+                        "Nilai": data["total"],
+                        "Status": data.get("status", "OK"),
+                        "Catatan": data.get("catatan", "")
+                    })
+                    berhasil += 1
+                else:
+                    batch_results.append({
+                        "Lembar": idx + 1,
+                        "Nomor": str(idx + 1),
+                        "Nama": "GAGAL",
+                        "Nilai": "-",
+                        "Status": "GAGAL",
+                        "Catatan": error or "Tidak diketahui"
+                    })
+                    gagal += 1
+
+            st.session_state["batch_results"] = batch_results
+            progress.progress(100, text="✅ Semua lembar selesai diproses.")
+
+            if gagal:
+                st.warning(f"Penilaian selesai: {berhasil} berhasil, {gagal} gagal.")
+            else:
+                st.success(f"🎉 {berhasil} lembar berhasil dinilai.")
+
+        except Exception as e:
+            st.error(f"❌ Gagal memproses batch: {e}")
+
+    if "batch_results" in st.session_state:
+        st.subheader("📊 Hasil Penilaian Batch")
+        st.dataframe(
+            pd.DataFrame(st.session_state["batch_results"]),
+            use_container_width=True,
+            hide_index=True
+        )
+        st.info(
+            "Nilai otomatis adalah bantuan pemeriksaan. "
+            "Lembar berstatus PERLU CEK sebaiknya diperiksa kembali dari foto aslinya."
+        )
+
 
 with tab2:
     con = db()
