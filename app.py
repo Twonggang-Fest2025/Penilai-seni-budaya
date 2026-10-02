@@ -51,13 +51,16 @@ def db():
     return con
 
 def client():
-    key = st.secrets.get("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY", ""))
-    return OpenAI(api_key=key) if key else None
+    key = st.secrets.get("GEMINI_API_KEY", os.getenv("GEMINI_API_KEY", ""))
+    return OpenAI(
+        api_key=key,
+        base_url="https://generativelanguage.googleapis.com/v1beta/openai/"
+    ) if key else None
 
 def score_sheet(img_bytes, kelas):
     cli = client()
     if not cli:
-        raise RuntimeError("OPENAI_API_KEY belum diatur di Secrets.")
+        raise RuntimeError("GEMINI_API_KEY belum diatur di Secrets.")
 
     b64 = base64.b64encode(img_bytes).decode("utf-8")
     rubric = "\n".join([f"Soal {k}: {v}" for k, v in RUBRICS[kelas].items()])
@@ -88,18 +91,22 @@ Kembalikan HANYA JSON valid dengan format:
  "catatan": ""
 }}
 """
-    response = cli.responses.create(
-        model="gpt-5",
-        input=[{
+    response = cli.chat.completions.create(
+        model="gemini-3.8-flash",
+        messages=[{
             "role": "user",
             "content": [
-                {"type": "input_text", "text": prompt},
-                {"type": "input_image", "image_url": f"data:image/jpeg;base64,{b64}"}
+                {"type": "text", "text": prompt},
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:image/jpeg;base64,{b64}"
+                    }
+                }
             ]
-        }],
-        store=False
+        }]
     )
-    text = response.output_text.strip()
+    text = response.choices[0].message.content.strip()
     if text.startswith("```"):
         text = text.replace("```json", "").replace("```", "").strip()
     data = json.loads(text)
@@ -122,7 +129,7 @@ def save_result(kelas, data, nomor=""):
     con.close()
 
 st.title("📝 Penilai Otomatis Seni Budaya")
-st.caption("Untuk pemeriksaan sekitar 700+ lembar siswa • 5 soal × 20 poin")
+st.caption("Untuk pemeriksaan sekitar 700+ lembar siswa • Gemini AI • 5 soal × 20 poin")
 
 tab1, tab2 = st.tabs(["📷 Nilai dari Foto", "📊 Rekap Nilai"])
 
