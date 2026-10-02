@@ -1,4 +1,3 @@
-
 import base64
 import json
 import os
@@ -9,7 +8,7 @@ from io import BytesIO
 import pandas as pd
 import streamlit as st
 from openai import OpenAI
-from PIL import Image
+from PIL import Image, ImageOps
 
 st.set_page_config(page_title="Penilai Seni Budaya 700+", page_icon="📝", layout="centered")
 
@@ -54,16 +53,61 @@ def client():
     key = st.secrets.get("GEMINI_API_KEY", os.getenv("GEMINI_API_KEY", ""))
     return OpenAI(
         api_key=key,
-        base_url="https://generativelanguage.googleapis.com/v1beta/openai/"
+        base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+        timeout=90.0,
+        max_retries=0
     ) if key else None
 
-def score_sheet(img_bytes, kelas):
+def optimize_image_bytes(img_bytes, max_side=1600, quality=78):
+    """Resize + compress image before sending it to the API."""
+    try:
+        img = Image.open(BytesIO(img_bytes))
+        img = ImageOps.exif_transpose(img).convert("RGB")
+        if max(img.size) > max_side:
+            scale = max_side / max(img.size)
+            img = img.resize(
+                (int(img.width * scale), int(img.height * scale)),
+                Image.Resampling.LANCZOS
+            )
+        out = BytesIO()
+        img.save(out, format="JPEG", quality=quality, optimize=True)
+        return out.getvalue()
+    except Exception:
+        return img_bytes
+
+
+def score_sheet(img_bytes, kelas, soal_images=None):
     cli = client()
     if not cli:
         raise RuntimeError("GEMINI_API_KEY belum diatur di Secrets.")
 
+    # Kompres/rescale foto agar upload ke API lebih ringan dan cepat.
+    img_bytes = optimize_image_bytes(img_bytes)
     b64 = base64.b64encode(img_bytes).decode("utf-8")
+
     rubric = "\n".join([f"Soal {k}: {v}" for k, v in RUBRICS[kelas].items()])
+
+    # Foto soal yang diunggah guru menjadi referensi tambahan.
+    soal_content = []
+    if soal_images:
+        soal_content.append({
+            "type": "text",
+            "text": "Berikut foto soal asli. Gunakan foto-foto ini sebagai acuan untuk mencocokkan pertanyaan dengan jawaban siswa. Jangan mengganti pertanyaan berdasarkan pengetahuan umum."
+        })
+        for idx, soal_bytes in enumerate(soal_images, start=1):
+            soal_b64 = base64.b64encode(
+                optimize_image_bytes(soal_bytes, max_side=1400, quality=75)
+            ).decode("utf-8")
+            soal_content.append({
+                "type": "text",
+                "text": f"Foto soal {idx}"
+            })
+            soal_content.append({
+                "type": "image_url",
+                "image_url": {
+                    "url": f"data:image/jpeg;base64,{soal_b64}"
+                }
+            })
     prompt = f"""
 Anda adalah asisten pemeriksa ujian esai Seni Budaya SMA.
 Kelas: {kelas}
@@ -95,16 +139,25 @@ Kembalikan HANYA JSON valid dengan format:
         model="gemini-3.8-flash",
         messages=[{
             "role": "user",
-            "content": [
-                {"type": "text", "text": prompt},
-                {
-                    "type": "image_url",
-                    "image_url": {
-                        "url": f"data:image/jpeg;base64,{b64}"
+            "content": (
+                [{"type": "text", "text": prompt}]
+                + soal_content
+                + [
+                    {
+                        "type": "text",
+                        "text": "Berikut foto lembar jawaban siswa yang harus dinilai."
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/jpeg;base64,{b64}"
+                        }
                     }
-                }
-            ]
-        }]
+                ]
+            )
+        }],
+        temperature=0,
+        max_tokens=1200
     )
     text = response.choices[0].message.content.strip()
     if text.startswith("```"):
@@ -136,20 +189,53 @@ tab1, tab2 = st.tabs(["📷 Nilai dari Foto", "📊 Rekap Nilai"])
 with tab1:
     kelas = st.selectbox("Pilih kelas / mata pelajaran", list(RUBRICS.keys()))
     nomor = st.text_input("Nomor/ID siswa (opsional)", placeholder="Contoh: 001")
+
+    st.subheader("📚 Foto Soal")
+    st.caption("Upload minimal 5 foto soal. Foto-foto ini akan menjadi referensi AI saat menilai jawaban siswa.")
+    foto_soal = st.file_uploader(
+        "📎 Upload minimal 5 foto soal",
+        type=["jpg", "jpeg", "png", "webp"],
+        accept_multiple_files=True,
+        key="foto_soal"
+    )
+
+    if foto_soal and len(foto_soal) < 5:
+        st.warning(f"⚠️ Baru {len(foto_soal)} foto soal. Minimal 5 foto diperlukan sebelum penilaian.")
+    elif foto_soal:
+        st.success(f"✅ {len(foto_soal)} foto soal siap digunakan sebagai referensi.")
+
     foto = st.camera_input("📸 Foto lembar jawaban")
     if foto is None:
         foto = st.file_uploader("Atau pilih foto dari galeri", type=["jpg","jpeg","png","webp"])
 
     if foto:
         st.image(foto, caption="Foto yang akan diperiksa", use_container_width=True)
-        if st.button("🚀 NILAI SEKARANG", type="primary", use_container_width=True):
-            with st.spinner("Membaca jawaban dan menilai..."):
+        siap_nilai = foto_soal is not None and len(foto_soal) >= 5
+
+        if st.button(
+            "🚀 NILAI SEKARANG",
+            type="primary",
+            use_container_width=True,
+            disabled=not siap_nilai
+        ):
+            with st.spinner("Membaca foto soal + jawaban dan menilai..."):
                 try:
-                    data = score_sheet(foto.getvalue(), kelas)
+                    soal_bytes = [f.getvalue() for f in foto_soal]
+                    data = score_sheet(
+                        foto.getvalue(),
+                        kelas,
+                        soal_images=soal_bytes
+                    )
                     st.session_state["hasil"] = data
                     save_result(kelas, data, nomor)
                 except Exception as e:
-                    st.error(f"Gagal memproses: {e}")
+                    err = str(e)
+                    if "timeout" in err.lower() or "timed out" in err.lower():
+                        st.error("⏱️ API terlalu lama merespons (batas 90 detik). Coba foto yang lebih jelas/kecil atau coba lagi.")
+                    elif "429" in err or "quota" in err.lower() or "resource_exhausted" in err.lower():
+                        st.error("⚠️ Kuota/kredit API sedang habis atau terkena batas penggunaan. Periksa penggunaan API Gemini.")
+                    else:
+                        st.error(f"❌ Gagal memproses: {err}")
 
     if "hasil" in st.session_state:
         d = st.session_state["hasil"]
